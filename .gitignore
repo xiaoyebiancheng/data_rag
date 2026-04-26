@@ -1,0 +1,39 @@
+# 环境变量，不能提交，可能有 API Key / 密码
+.env
+.env.*
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+.pycache/
+
+# 虚拟环境
+.venv/
+venv/
+
+# IDE 配置
+.idea/
+.vscode/
+
+# 运行日志、临时文件、输出文件
+logs/
+tmp/
+output/
+
+# 大文件压缩包，不提交到 GitHub
+*.zip
+
+# 项目资料大文件
+doc/设备手册汇总.zip
+
+# macOS 系统文件
+.DS_Store
+
+# 测试/评估报告，按需提交；不想提交就保留
+reports/
+
+# 原始知识库文档，不提交到 GitHub
+doc/
+*.pdf
+*.zip
+*.xlsx
