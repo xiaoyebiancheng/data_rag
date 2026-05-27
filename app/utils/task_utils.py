@@ -1,29 +1,34 @@
-from typing import Dict, List
+import traceback
+from typing import Any, Dict, List, Optional
+
+from app.clients.import_task_repository import ImportTaskStatus, get_import_task_repository
+from app.core.logger import logger
 from .sse_utils import push_to_session
 
 # ---------------------------
 # 内存态任务追踪（单进程）
 # ---------------------------
-# key: task_id
-# value: 节点名列表（原始英文/节点ID）
 _tasks_running_list: Dict[str, List[str]] = {}
 _tasks_done_list: Dict[str, List[str]] = {}
-
-# key: task_id
-# value: status 字符串（如 pending/processing/completed/failed）
 _tasks_status: Dict[str, str] = {}
-
-# key: task_id
-# value: 任务结果（例如 query 的 answer）
-_tasks_result: Dict[str, Dict[str, str]] = {}
+_tasks_result: Dict[str, Dict[str, Any]] = {}
 
 TASK_STATUS_PENDING = "pending"
 TASK_STATUS_PROCESSING = "processing"
 TASK_STATUS_COMPLETED = "completed"
 TASK_STATUS_FAILED = "failed"
 
-# 节点名 -> 中文名映射（用于前端展示）
-# 说明：这里的 key 应与 LangGraph 的 add_node("xxx", ...) 中的节点名一致。
+_IMPORT_NODE_NAMES = {
+    "upload_file",
+    "node_entry",
+    "node_pdf_to_md",
+    "node_md_img",
+    "node_item_name_recognition",
+    "node_document_split",
+    "node_bge_embedding",
+    "node_import_milvus",
+}
+
 _NODE_NAME_TO_CN: Dict[str, str] = {
     "upload_file": "开始上传文件",
     "node_entry": "检查文件",
@@ -36,7 +41,6 @@ _NODE_NAME_TO_CN: Dict[str, str] = {
     "node_import_milvus": "导入向量库",
     "__end__": "处理完成",
     "END": "处理完成",
-    # --- Query 流程节点（kb/query_process/main_graph.py）---
     "node_item_name_confirm": "确认问题产品",
     "node_answer_output": "生成答案",
     "node_rerank": "重排序",
@@ -51,7 +55,6 @@ _NODE_NAME_TO_CN: Dict[str, str] = {
 
 
 def _ensure_task(task_id: str) -> None:
-    """确保 task_id 对应的数据结构已初始化。"""
     if task_id not in _tasks_running_list:
         _tasks_running_list[task_id] = []
     if task_id not in _tasks_done_list:
@@ -61,114 +64,193 @@ def _ensure_task(task_id: str) -> None:
 
 
 def _to_cn(node_name: str) -> str:
-    """将节点名转换为中文展示名；若无映射则返回原名。"""
     return _NODE_NAME_TO_CN.get(node_name, node_name)
 
 
-def add_running_task(task_id: str, node_name: str, is_stream: bool = False) -> None:
-    """
-    添加“正在运行”的节点任务。
+def _safe_import_repo():
+    try:
+        return get_import_task_repository()
+    except Exception as exc:
+        logger.warning(f"ImportTaskRepository 不可用，回退到内存态任务追踪: {exc}")
+        return None
 
-    参数：
-    - task_id: 任务ID
-    - node_name: 节点名称(节点ID)
-    """
+
+def _is_import_task(task_id: str, node_name: Optional[str] = None) -> bool:
+    if node_name and node_name in _IMPORT_NODE_NAMES:
+        return True
+    repo = _safe_import_repo()
+    if repo is None:
+        return False
+    return repo.get_task(task_id) is not None
+
+
+def init_import_task(
+    task_id: str,
+    *,
+    file_title: str,
+    source_path: str,
+    local_dir: str,
+    status: str = ImportTaskStatus.PENDING,
+    max_retry: int = 1,
+) -> None:
+    repo = _safe_import_repo()
+    if repo is None:
+        return
+    repo.upsert_task(
+        {
+            "task_id": task_id,
+            "doc_id": "",
+            "file_hash": "",
+            "file_title": file_title,
+            "status": status,
+            "current_node": "",
+            "retry_count": 0,
+            "max_retry": max_retry,
+            "error_stack": "",
+            "finished_at": None,
+            "source_path": source_path,
+            "local_dir": local_dir,
+        }
+    )
+
+
+def update_import_task_fields(task_id: str, **fields: Any) -> None:
+    repo = _safe_import_repo()
+    if repo is None:
+        return
+    repo.update_task_fields(task_id, **fields)
+
+
+def get_import_task(task_id: str) -> Optional[Dict[str, Any]]:
+    repo = _safe_import_repo()
+    if repo is None:
+        return None
+    return repo.get_task(task_id)
+
+
+def list_import_task_node_logs(task_id: str) -> List[Dict[str, Any]]:
+    repo = _safe_import_repo()
+    if repo is None:
+        return []
+    return repo.list_node_logs(task_id)
+
+
+def increment_import_task_retry(task_id: str) -> int:
+    repo = _safe_import_repo()
+    if repo is None:
+        return 0
+    return repo.increment_retry(task_id)
+
+
+def add_running_task(task_id: str, node_name: str, is_stream: bool = False) -> None:
     _ensure_task(task_id)
     running = _tasks_running_list[task_id]
-    # 避免重复追加
     if node_name not in running:
         running.append(node_name)
-
+    if _is_import_task(task_id, node_name):
+        repo = _safe_import_repo()
+        if repo is not None:
+            task = repo.get_task(task_id) or {}
+            repo.start_node(task_id, node_name, retry_count=int(task.get("retry_count", 0)))
+            repo.update_task_fields(task_id, current_node=node_name, status=ImportTaskStatus.RUNNING)
     if is_stream:
         task_push_queue(task_id)
 
 
 def add_done_task(task_id: str, node_name: str, is_stream: bool = False) -> None:
-    """
-    添加“已完成”的节点任务。
-
-    注意：添加已完成任务时，会把同名的“正在运行”任务删除。
-
-    参数：
-    - task_id: 任务ID
-    - node_name: 节点名称(节点ID)
-    """
     _ensure_task(task_id)
-
-    # 1) 从 running 中移除同名节点（可能出现重复，移除所有）
     running = _tasks_running_list[task_id]
     _tasks_running_list[task_id] = [n for n in running if n != node_name]
-
-    # 2) 追加到 done（保持完成顺序），避免重复
     done = _tasks_done_list[task_id]
     if node_name not in done:
         done.append(node_name)
-
+    if _is_import_task(task_id, node_name):
+        repo = _safe_import_repo()
+        if repo is not None:
+            repo.finish_node(task_id, node_name, status="SUCCESS")
     if is_stream:
         task_push_queue(task_id)
 
 
-def set_task_result(task_id: str, key: str, value: str) -> None:
-    """
-    存储任务结果字段（如 answer / error）。
-    """
+def fail_running_import_node(task_id: str, error_message: str) -> None:
+    repo = _safe_import_repo()
+    if repo is None:
+        return
+    running = _tasks_running_list.get(task_id, [])
+    node_name = running[-1] if running else ""
+    if node_name:
+        repo.finish_node(task_id, node_name, status="FAILED", error_message=error_message)
+        repo.update_task_fields(task_id, current_node=node_name)
+
+
+def set_task_result(task_id: str, key: str, value: Any) -> None:
     _ensure_task(task_id)
     _tasks_result[task_id][key] = value
+    if _is_import_task(task_id):
+        mapped_fields = {}
+        if key == "doc_id":
+            mapped_fields["doc_id"] = value
+        elif key == "document_status":
+            mapped_fields["status"] = value
+        elif key == "error":
+            mapped_fields["error_stack"] = value
+        elif key == "file_hash":
+            mapped_fields["file_hash"] = value
+        elif key == "file_title":
+            mapped_fields["file_title"] = value
+        if mapped_fields:
+            update_import_task_fields(task_id, **mapped_fields)
 
 
-def get_task_result(task_id: str, key: str, default: str = "") -> str:
-    """
-    获取任务结果字段（如 answer / error）。
-    """
+def get_task_result(task_id: str, key: str, default: Any = "") -> Any:
     _ensure_task(task_id)
     return _tasks_result.get(task_id, {}).get(key, default)
 
 
 def get_task_status(task_id: str) -> str:
-    """
-    获取当前任务状态。
-
-    参数：
-    - task_id: 任务ID
-
-    返回：
-    - str: 状态名称；如果未设置过则返回空字符串
-    """
     return _tasks_status.get(task_id, "")
 
 
 def get_done_task_list(task_id: str) -> List[str]:
-    """
-    获取已完成节点列表（中文展示）。
-
-
-    """
     _ensure_task(task_id)
-    done = _tasks_done_list.get(task_id, [])
-    return [_to_cn(n) for n in done]
+    return [_to_cn(n) for n in _tasks_done_list.get(task_id, [])]
 
 
 def get_running_task_list(task_id: str) -> List[str]:
-    """
-    获取正在运行节点列表（中文展示）。
-
-    """
     _ensure_task(task_id)
-    running = _tasks_running_list.get(task_id, [])
-    return [_to_cn(n) for n in running]
+    return [_to_cn(n) for n in _tasks_running_list.get(task_id, [])]
 
 
 def update_task_status(task_id: str, status_name: str, push_queue: bool = False) -> None:
-    """
-    更新任务状态。
-
-    参数：
-    - task_id: 任务ID
-    - status_name: 状态名称（字符串）
-    """
     _tasks_status[task_id] = status_name
+    if _is_import_task(task_id):
+        import_status = {
+            TASK_STATUS_PENDING: ImportTaskStatus.PENDING,
+            TASK_STATUS_PROCESSING: ImportTaskStatus.RUNNING,
+            TASK_STATUS_COMPLETED: ImportTaskStatus.SUCCESS,
+            TASK_STATUS_FAILED: ImportTaskStatus.FAILED,
+        }.get(status_name, status_name.upper())
+        update_import_task_fields(task_id, status=import_status, finished_at=None if status_name == TASK_STATUS_PROCESSING else None)
     if push_queue:
         task_push_queue(task_id)
+
+
+def mark_import_task_finished(task_id: str, status: str, error_stack: str = "") -> None:
+    repo = _safe_import_repo()
+    if repo is None:
+        return
+    repo.update_task_fields(
+        task_id,
+        status=status,
+        error_stack=error_stack,
+        finished_at=repo._utcnow(),
+    )
+
+
+def record_import_task_failure(task_id: str, exc: Exception) -> None:
+    error_stack = traceback.format_exc()
+    fail_running_import_node(task_id, str(exc))
+    update_import_task_fields(task_id, status=ImportTaskStatus.FAILED, error_stack=error_stack)
 
 
 def task_push_queue(task_id: str):
@@ -179,7 +261,6 @@ def task_push_queue(task_id: str):
     })
 
 
-#
 def clear_task(task_id: str):
     _tasks_running_list.pop(task_id, None)
     _tasks_done_list.pop(task_id, None)

@@ -5,7 +5,8 @@ from dotenv import load_dotenv
 
 from app.core.logger import logger
 from app.utils.task_utils import add_running_task, add_done_task
-from lm.reranker_utils import get_reranker_model
+from app.lm.reranker_utils import get_reranker_model
+from app.query_process.retrieval.query_profile import DEFAULT_RETRIEVAL_CONFIG
 
 # 提前加载.env配置文件（保持和原代码一致，只需执行一次）
 load_dotenv()
@@ -46,12 +47,25 @@ def step_1_merge_rrf_mcp(state):
         chunk_id = entity.get("chunk_id")
         content = entity.get("content")
         title = entity.get("title")
+        parent_title = entity.get("parent_title", "")
+        file_title = entity.get("file_title", "")
+        item_name = entity.get("item_name", "")
+        doc_id = entity.get("doc_id", "")
+        version = entity.get("version", 0)
+        raw_score = chunk.get("distance", 0.0)
         chunks_list.append({
             "text": content,
             "chunk_id": chunk_id,
             "title": title,
+            "parent_title": parent_title,
+            "file_title": file_title,
+            "item_name": item_name,
+            "doc_id": doc_id,
+            "version": version,
             "url": "",
             "source": "local"
+            ,
+            "retrieval_score": raw_score,
         })
     # 3.2 web mcp
     for doc in web_search_docs:
@@ -91,6 +105,7 @@ def step_2_rerank_doc_list(doc_list, state):
 
     for score, item in zip(scores, doc_list):
         item["score"] = score
+        item["rerank_score"] = score
         doc_list_with_score.append(item)
     doc_list_with_score.sort(key=lambda x: x["score"], reverse=True)
     logger.info(f"多路数据排序和打分.最终结果为: {doc_list_with_score}")
@@ -132,6 +147,19 @@ def step_3_topk_and_gap(rerank_score_list):
     return topk_doc_list
 
 
+def step_3_topk_by_config(doc_list, rerank_top_n):
+    topk = max(1, min(int(rerank_top_n), len(doc_list)))
+    final_doc_list = doc_list[:topk]
+    logger.info(f"根据动态配置截取TopK,长度为:{topk},内容为:{final_doc_list}")
+    return final_doc_list
+
+
+def _get_retrieval_config(state):
+    retrieval_config = dict(DEFAULT_RETRIEVAL_CONFIG.__dict__)
+    retrieval_config.update(state.get("retrieval_config", {}) or {})
+    return retrieval_config
+
+
 def node_rerank(state):
     """
     节点作用 : rrf + mcp -> 精排序rerank ->chunk - 打分 -> 算法 -> top k
@@ -140,6 +168,11 @@ def node_rerank(state):
     """
     print("---Rerank处理---")
     add_running_task(state["session_id"], sys._getframe().f_code.co_name, state.get("is_stream"))
+    retrieval_config = _get_retrieval_config(state)
+    logger.info(
+        f"Rerank动态策略: query_type={state.get('query_type', '')}, "
+        f"use_rerank={retrieval_config.get('use_rerank')}, retrieval_config={retrieval_config}"
+    )
     # 1.非同源路的结果合并(rrf+mcp) 放到一个集合中
     """
         [
@@ -157,6 +190,13 @@ def node_rerank(state):
     """
     doc_list = step_1_merge_rrf_mcp(state)
 
+    if not retrieval_config.get("use_rerank", DEFAULT_RETRIEVAL_CONFIG.use_rerank):
+        # 优化: 优化的原因是部分查询没有必要走最重的精排链路，直接复用RRF融合结果可减少时延，同时保持主流程节点不变。
+        final_doc_list = step_3_topk_by_config(doc_list, retrieval_config.get("top_k", DEFAULT_RETRIEVAL_CONFIG.top_k))
+        state["reranked_docs"] = final_doc_list
+        add_done_task(state['session_id'], sys._getframe().f_code.co_name, state.get("is_stream"))
+        return state
+
     # 2.启用rerank进行精排 (数据和分)
     rerank_score_list = step_2_rerank_doc_list(doc_list, state)
 
@@ -173,6 +213,8 @@ def node_rerank(state):
 
     # 3.启动算法进行防断崖以及top_k处理
     final_doc_list = step_3_topk_and_gap(rerank_score_list)
+    rerank_top_n = retrieval_config.get("rerank_top_n", DEFAULT_RETRIEVAL_CONFIG.rerank_top_n)
+    final_doc_list = final_doc_list[:max(1, int(rerank_top_n))]
     state["reranked_docs"] = final_doc_list
     add_done_task(state['session_id'], sys._getframe().f_code.co_name, state.get("is_stream"))
     return state

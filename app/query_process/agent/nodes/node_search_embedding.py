@@ -1,14 +1,119 @@
 import sys
-import os
-from app.utils.task_utils import add_running_task, add_done_task
-from app.lm.embedding_utils import generate_embeddings
-from app.clients.milvus_utils import create_hybrid_search_requests, hybrid_search, get_milvus_client
-from app.core.logger import logger
-from dotenv import load_dotenv, find_dotenv
 
-from conf.milvus_config import milvus_config
+from app.clients.milvus_utils import create_hybrid_search_requests, get_milvus_client, hybrid_search
+from app.core.logger import logger
+from app.lm.embedding_utils import generate_embeddings
+from app.query_process.retrieval.milvus_filtering import build_item_name_expr, build_metadata_expr, combine_expr
+from app.query_process.retrieval.query_profile import DEFAULT_RETRIEVAL_CONFIG
+from app.utils.task_utils import add_running_task, add_done_task
+from dotenv import find_dotenv, load_dotenv
+
+from app.conf.milvus_config import milvus_config
 
 load_dotenv(find_dotenv())
+
+
+def _get_retrieval_config(state):
+    retrieval_config = dict(DEFAULT_RETRIEVAL_CONFIG.__dict__)
+    retrieval_config.update(state.get("retrieval_config", {}) or {})
+    retrieval_config.setdefault("metadata_filters", {})
+    return retrieval_config
+
+
+def _search_chunks(rewritten_query, item_names, retrieval_config, security_filter_expr=""):
+    embeddings = generate_embeddings([rewritten_query])
+    item_name_expr = build_item_name_expr(item_names)
+    metadata_expr = build_metadata_expr(retrieval_config.get("metadata_filters", {}))
+    full_expr = combine_expr(security_filter_expr, item_name_expr, metadata_expr)
+    logger.info(
+        f"动态检索配置已生效: query_type={retrieval_config.get('query_type', '')}, "
+        f"expr={full_expr or item_name_expr or '<empty>'}, retrieval_config={retrieval_config}"
+    )
+
+    hybrid_search_requests = create_hybrid_search_requests(
+        dense_vector=embeddings["dense"][0],
+        sparse_vector=embeddings["sparse"][0],
+        expr=full_expr or combine_expr(security_filter_expr, item_name_expr) or None,
+        limit=int(retrieval_config.get("top_k", DEFAULT_RETRIEVAL_CONFIG.top_k)),
+    )
+    milvus_client = get_milvus_client()
+    resp = hybrid_search(
+        client=milvus_client,
+        collection_name=milvus_config.chunks_collection,
+        reqs=hybrid_search_requests,
+        ranker_weights=(
+            float(retrieval_config.get("dense_weight", DEFAULT_RETRIEVAL_CONFIG.dense_weight)),
+            float(retrieval_config.get("sparse_weight", DEFAULT_RETRIEVAL_CONFIG.sparse_weight)),
+        ),
+        norm_score=True,
+        limit=int(retrieval_config.get("top_k", DEFAULT_RETRIEVAL_CONFIG.top_k)),
+        output_fields=[
+            "chunk_id",
+            "doc_id",
+            "content",
+            "file_title",
+            "title",
+            "parent_title",
+            "item_name",
+            "version",
+            "doc_type",
+            "section_type",
+            "product_line",
+            "language",
+            "source_priority",
+            "tenant_id",
+            "department_id",
+            "visibility",
+        ],
+    )
+    result = resp[0] if resp else []
+    if result or not metadata_expr:
+        return result
+
+    # 优化: 优化的原因是旧文档可能没有新增业务metadata字段，但安全过滤不能被放松，所以回退时只移除业务标签过滤，保留租户/部门/可见性约束。
+    logger.info("metadata过滤未命中结果，回退到仅保留安全过滤和item_name的兼容检索逻辑")
+    security_filters = {
+        key: value
+        for key, value in (retrieval_config.get("metadata_filters", {}) or {}).items()
+        if key in {"tenant_id", "department_id", "visibility"}
+    }
+    fallback_expr = combine_expr(security_filter_expr, item_name_expr, build_metadata_expr(security_filters))
+    fallback_requests = create_hybrid_search_requests(
+        dense_vector=embeddings["dense"][0],
+        sparse_vector=embeddings["sparse"][0],
+        expr=fallback_expr or combine_expr(security_filter_expr, item_name_expr) or None,
+        limit=int(retrieval_config.get("top_k", DEFAULT_RETRIEVAL_CONFIG.top_k)),
+    )
+    fallback_resp = hybrid_search(
+        client=milvus_client,
+        collection_name=milvus_config.chunks_collection,
+        reqs=fallback_requests,
+        ranker_weights=(
+            float(retrieval_config.get("dense_weight", DEFAULT_RETRIEVAL_CONFIG.dense_weight)),
+            float(retrieval_config.get("sparse_weight", DEFAULT_RETRIEVAL_CONFIG.sparse_weight)),
+        ),
+        norm_score=True,
+        limit=int(retrieval_config.get("top_k", DEFAULT_RETRIEVAL_CONFIG.top_k)),
+        output_fields=[
+            "chunk_id",
+            "doc_id",
+            "content",
+            "file_title",
+            "title",
+            "parent_title",
+            "item_name",
+            "version",
+            "doc_type",
+            "section_type",
+            "product_line",
+            "language",
+            "source_priority",
+            "tenant_id",
+            "department_id",
+            "visibility",
+        ],
+    )
+    return fallback_resp[0] if fallback_resp else []
 
 
 def node_search_embedding(state):
@@ -16,60 +121,21 @@ def node_search_embedding(state):
     节点功能：进行向量内容检索
     主要作用: 问题 -> 查询chunks切片
     达到目标: {"embedding_chunks":[chunks]}
-    需要参数:
-            {
-                rewritten_query:重写的问题 -> 根据它查询
-                item_name:[]  -> 明确的主体
-            }
     """
     print("---量内容检索 开始处理---")
     add_running_task(state["session_id"], sys._getframe().f_code.co_name, state.get("is_stream"))
-    # 搜索假设性答案
-    # 1.先从state获取参数数据
     rewritten_query = state.get("rewritten_query")
     item_names = state.get("item_names")
-    # 2.将重写问题生成对应的向量[稠密和稀疏]
-    embeddings = generate_embeddings([rewritten_query])
-    # 3.进行向量数据库的混合查询
-    # 3.1 创建混合查询请求对象AnnSearchRequest
-    # 查询条件:1.向量索引 2.item_name一定要在item_name里 混合查询的查询条件 item_name(字段) in [item_names]
-    # 因为 item_name 是字符串字段。Milvus 的过滤表达式里，字符串值必须带引号。
-    # 给每个 item_name 外面套上双引号,再把它们拼成逗号分隔的字符串
-    item_name_str = ', '.join(f'"{item_name}"' for item_name in item_names)
-    hybrid_search_requests = create_hybrid_search_requests(
-        dense_vector=embeddings['dense'][0],
-        sparse_vector=embeddings['sparse'][0],
-        expr=f"item_name in [{item_name_str}]",
-    )
-    # 3.2 调用混合查询方法
-    milvus_client = get_milvus_client()
-    resp = hybrid_search(
-        client=milvus_client,
-        collection_name=milvus_config.chunks_collection,
-        reqs=hybrid_search_requests,
-        ranker_weights=(0.9, 0.1),
-        norm_score=True,
-        limit=5,
-        output_fields=["chunk_id", "content", "file_title", "title", "parent_title", "item_name"],
-    )
-    # 得到结果格式
-    """
-        [
-            [
-                id,
-                distance,
-                entity:
-                {
-                    "chunk_id", "content", "file_title","title", "parent_title", "item_name"
-                }
-            ]
-        ]
-    """
+    retrieval_config = _get_retrieval_config(state)
+    retrieval_config["query_type"] = state.get("query_type", "")
 
-    # 4.处理查询结果赋值 embedding_chunks属性即可
-    embedding_chunks = resp[0] if resp else []
+    embedding_chunks = _search_chunks(
+        rewritten_query,
+        item_names,
+        retrieval_config,
+        state.get("security_filter_expr", ""),
+    )
     logger.info(f"向量混合检索结果:{embedding_chunks}")
-    # ...
     add_done_task(state["session_id"], sys._getframe().f_code.co_name, state.get("is_stream"))
 
     print("---量内容检索 处理结束---")
@@ -77,34 +143,16 @@ def node_search_embedding(state):
 
 
 if __name__ == "__main__":
-    # 模拟测试数据
     test_state = {
         "session_id": "test_search_embedding_001",
-        "rewritten_query": "HAK 180 烫金机使用说明",  # 模拟改写后的查询
-        "item_names": ["HAK 180 烫金机"],  # 模拟已确认的商品名
-        "is_stream": False
+        "rewritten_query": "HAK 180 烫金机使用说明",
+        "item_names": ["HAK 180 烫金机"],
+        "is_stream": False,
     }
 
     print("\n>>> 开始测试 node_search_embedding 节点...")
     try:
-        # 执行节点函数
         result = node_search_embedding(test_state)
         logger.info(f"检索结果汇总：{result}")
-        # 验证结果
-        chunks = result.get("embedding_chunks", [])
-        print(f"\n>>> 测试完成！检索到 {len(chunks)} 条结果")
-
-        if chunks:
-            print("\n>>> Top 1 结果详情:")
-            top1 = chunks[0]
-            # 打印关键字段（注意：entity字段可能包含具体业务数据）
-            print(f"ID: {top1.get('id')}")
-            print(f"Distance: {top1.get('distance')}")
-            entity = top1.get('entity', {})
-            print(f"Item Name: {entity.get('item_name')}")
-            print(f"Content Preview: {entity.get('content', '')[:100]}...")
-        else:
-            print("\n>>> 警告：未检索到任何结果，请检查 Milvus 数据或 item_names 是否匹配")
-
     except Exception as e:
         logger.error(f"测试运行失败: {e}", exc_info=True)

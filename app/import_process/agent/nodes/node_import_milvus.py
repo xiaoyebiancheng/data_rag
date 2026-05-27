@@ -20,6 +20,7 @@ from app.conf.milvus_config import milvus_config
 from app.core.logger import logger
 # 导入自定义模块
 from app.import_process.agent.state import ImportGraphState
+from app.import_process.metadata_tagging import enrich_document_and_chunks
 from app.utils.escape_milvus_string_utils import escape_milvus_string
 from app.utils.task_utils import add_running_task, add_done_task, set_task_result
 
@@ -154,12 +155,15 @@ def step_4_insert_collections(milvus_client, chunks):
 
 
 def step_3_1_fill_milvus_metadata(state: ImportGraphState, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    # 增: 增的原因是Milvus中的切片需要携带doc_id/file_hash/version，后续才能支持按版本精确删除和审计。
+    # 增: 增的原因是Milvus中的切片需要携带doc_id/file_hash/version以及metadata标签，后续才能支持按版本精确删除、标签过滤和审计。
     for chunk in chunks:
         chunk["doc_id"] = state.get("doc_id", "")
         chunk["file_hash"] = state.get("file_hash", "")
         chunk["version"] = int(state.get("version", 1))
         chunk["status"] = ChunkStatus.ACTIVE
+        chunk["tenant_id"] = state.get("tenant_id", "default")
+        chunk["department_id"] = state.get("department_id", "default")
+        chunk["visibility"] = state.get("visibility", "internal")
     return chunks
 
 
@@ -178,6 +182,14 @@ def step_5_write_metadata(state: ImportGraphState) -> None:
         "minio_urls": state.get("minio_urls", []),
         "source_path": state.get("local_file_path", ""),
         "local_dir": state.get("local_dir", ""),
+        "doc_type": state.get("doc_type", "other"),
+        "product_line": state.get("product_line", ""),
+        "language": state.get("language", "zh-CN"),
+        "source_priority": int(state.get("source_priority", 50)),
+        "tenant_id": state.get("tenant_id", "default"),
+        "department_id": state.get("department_id", "default"),
+        "visibility": state.get("visibility", "internal"),
+        "created_by": state.get("created_by", ""),
     }
     repository.upsert_document_meta(document_meta)
 
@@ -204,6 +216,15 @@ def step_5_write_metadata(state: ImportGraphState) -> None:
             "item_name": chunk.get("item_name", ""),
             "milvus_collection": CHUNKS_COLLECTION_NAME,
             "status": ChunkStatus.ACTIVE,
+            "doc_type": chunk.get("doc_type", state.get("doc_type", "other")),
+            "section_type": chunk.get("section_type", "other"),
+            "product_line": chunk.get("product_line", state.get("product_line", "")),
+            "language": chunk.get("language", state.get("language", "zh-CN")),
+            "source_priority": int(chunk.get("source_priority", state.get("source_priority", 50))),
+            "tenant_id": chunk.get("tenant_id", state.get("tenant_id", "default")),
+            "department_id": chunk.get("department_id", state.get("department_id", "default")),
+            "visibility": chunk.get("visibility", state.get("visibility", "internal")),
+            "created_by": state.get("created_by", ""),
         })
     repository.upsert_chunk_metas(chunk_metas)
 
@@ -222,6 +243,14 @@ def step_6_mark_failed(state: ImportGraphState) -> None:
         "minio_urls": state.get("minio_urls", []),
         "source_path": state.get("local_file_path", ""),
         "local_dir": state.get("local_dir", ""),
+        "doc_type": state.get("doc_type", "other"),
+        "product_line": state.get("product_line", ""),
+        "language": state.get("language", "zh-CN"),
+        "source_priority": int(state.get("source_priority", 50)),
+        "tenant_id": state.get("tenant_id", "default"),
+        "department_id": state.get("department_id", "default"),
+        "visibility": state.get("visibility", "internal"),
+        "created_by": state.get("created_by", ""),
     })
 
 def node_import_milvus(state: ImportGraphState) -> ImportGraphState:
@@ -246,6 +275,15 @@ def node_import_milvus(state: ImportGraphState) -> ImportGraphState:
 
         # 2.没有集合,要创建集合collection(filed,index,collection)
         milvus_client = step_2_prepare_collections(state)
+        # 增: 增的原因是新增metadata标签需要尽量在导入末端统一推断，避免改动前序切片和识别节点结构。
+        doc_metadata, chunks = enrich_document_and_chunks(state.get("file_title", ""), state.get("item_name", ""), chunks)
+        state["doc_type"] = doc_metadata.get("doc_type", "other")
+        state["product_line"] = doc_metadata.get("product_line", "")
+        state["language"] = doc_metadata.get("language", "zh-CN")
+        state["source_priority"] = int(doc_metadata.get("source_priority", 50))
+        state["tenant_id"] = doc_metadata.get("tenant_id", "default")
+        state["department_id"] = doc_metadata.get("department_id", "default")
+        state["visibility"] = doc_metadata.get("visibility", "internal")
         chunks = step_3_1_fill_milvus_metadata(state, chunks)
         # 3.删除旧数据(根据doc_id / file_title+version / item_name 逐级清理)
         step_3_delete_old_data(milvus_client, state)

@@ -1,30 +1,18 @@
-from pathlib import Path
-from app.utils.path_util import PROJECT_ROOT
-from app.core.logger import logger  # 可选，加日志更友好
+from app.core.logger import logger
+from app.prompts.prompt_registry import get_prompt_definition, render_prompt
 
-def load_prompt(name: str, **kwargs) -> str:
+
+def load_prompt(name: str, version: str | None = None, **kwargs) -> str:
     """
-    加载提示词并渲染变量占位符
-    :param name: 提示词文件名（不带.prompt后缀，如image_summary）
-    :param **kwargs: 需渲染的变量键值对（如root_folder="测试文件", image_content=("上文内容", "下文内容")）
-    :return: 渲染后的最终提示词字符串
+    统一加载 Prompt 模板并渲染变量。
+    默认通过 Prompt Registry 获取模板元数据，保持旧调用方式兼容。
     """
-    # 1. 拼接提示词路径（你的原有逻辑，完全保留）
-    prompt_path = PROJECT_ROOT / 'prompts' / f'{name}.prompt'
-
-    # 2. 校验文件是否存在（可选，避免文件不存在直接报错）
-    if not prompt_path.exists():
-        raise FileNotFoundError(f"提示词文件不存在：{prompt_path.absolute()}")
-
-    # 3. 读取纯文本提示词（你的原有逻辑）
-    raw_prompt = prompt_path.read_text(encoding='utf-8')
-
-    # 4. 核心：如果传了参数，渲染占位符；没传参，直接返回原文本
-    if kwargs:
-        rendered_prompt = raw_prompt.format(**kwargs)
-        logger.debug(f"提示词渲染成功，替换变量：{list(kwargs.keys())}")
-        return rendered_prompt
-    return raw_prompt
+    definition = get_prompt_definition(name, version=version)
+    rendered_prompt = render_prompt(name, version=definition.version, **kwargs)
+    logger.debug(
+        f"提示词渲染成功，prompt={definition.prompt_name}, version={definition.version}, 变量={list(kwargs.keys())}"
+    )
+    return rendered_prompt
 
 
 

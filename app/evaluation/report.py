@@ -107,6 +107,7 @@ def _build_bad_case_section(summaries: Sequence[StrategySummary]) -> List[str]:
         lines.append(f"- Faithfulness Reason: {result.faithfulness_reason or '-'}")
         lines.append(f"- Answer Relevance: {_format_metric(result.answer_relevance)}")
         lines.append(f"- Answer Relevance Reason: {result.answer_relevance_reason or '-'}")
+        lines.append(f"- Prompt Versions: {result.prompt_versions or '-'}")
         lines.append(f"- Error: {result.error or '-'}")
         lines.append(f"- Answer: {result.answer or '-'}")
         lines.append("")
@@ -158,7 +159,12 @@ def _build_recommendations(summaries: Sequence[StrategySummary]) -> List[str]:
     return lines
 
 
-def build_markdown_report(summaries: Sequence[StrategySummary], dataset_path: str, top_k: int) -> str:
+def build_markdown_report(
+    summaries: Sequence[StrategySummary],
+    dataset_path: str,
+    top_k: int,
+    prompt_versions: Dict[str, str] | None = None,
+) -> str:
     # 增: 增的原因是离线评测需要标准化 Markdown 报告，方便你后续直接做策略复盘、PR 说明和阶段性汇报。
     lines: List[str] = [
         "# RAG 离线评测报告",
@@ -166,6 +172,7 @@ def build_markdown_report(summaries: Sequence[StrategySummary], dataset_path: st
         f"- Dataset: `{dataset_path}`",
         f"- Top K: `{top_k}`",
         f"- Strategy Count: `{len(summaries)}`",
+        f"- Prompt Versions: `{prompt_versions or {}}`",
         "",
         "## 总体指标",
         "",

@@ -2,6 +2,7 @@ import sys
 import os
 import json
 import logging
+from dataclasses import asdict
 from typing import List, Dict, Any, Optional
 from langchain_core.messages import SystemMessage, HumanMessage
 from mpmath import limit
@@ -13,9 +14,11 @@ from app.clients.mongo_history_utils import get_recent_messages, save_chat_messa
 from app.lm.lm_utils import get_llm_client
 from app.lm.embedding_utils import generate_embeddings
 from app.clients.milvus_utils import get_milvus_client, create_hybrid_search_requests, hybrid_search
+from app.query_process.retrieval.query_profile import build_query_profile
+from app.security.auth import build_milvus_security_expr
 from dotenv import load_dotenv, find_dotenv
 from app.core.logger import logger
-from conf.milvus_config import milvus_config
+from app.conf.milvus_config import milvus_config
 
 load_dotenv(find_dotenv())
 
@@ -189,6 +192,35 @@ def step_6_deal_list(state,item_results,history_chats,rewritten_query):
     logger.info(f"没有匹配的item_name")
     return state
 
+
+def step_7_build_query_profile(state, rewritten_query):
+    # 增: 增的原因是查询链路需要根据问题类型动态选择检索参数，但不能改动现有LangGraph主流程，所以在确认主体节点补充轻量画像最稳妥。
+    profile = build_query_profile(
+        original_query=state.get("original_query", ""),
+        rewritten_query=rewritten_query or state.get("original_query", ""),
+        item_names=state.get("item_names", []),
+    )
+    auth_metadata_filters = {
+        "tenant_id": state.get("tenant_id", "default"),
+        "department_id": state.get("department_id", "default"),
+        "visibility": state.get("visibility", "tenant"),
+    }
+    merged_metadata_filters = dict(auth_metadata_filters)
+    merged_metadata_filters.update(profile.retrieval_config.metadata_filters)
+    state["query_type"] = profile.query_type
+    state["retrieval_config"] = asdict(profile.retrieval_config)
+    state["metadata_filters"] = merged_metadata_filters
+    state["retrieval_config"]["metadata_filters"] = merged_metadata_filters
+    state["security_filter_expr"] = build_milvus_security_expr(
+        type("AuthState", (), {
+            "tenant_id": state.get("tenant_id", "default"),
+            "department_id": state.get("department_id", "default"),
+            "user_id": state.get("user_id", ""),
+        })()
+    )
+    logger.info(f"查询画像识别完成:{profile.to_log_dict()}")
+    return state
+
 def node_item_name_confirm(state):
     """
     节点功能：确认用户问题中的核心商品名称。
@@ -242,6 +274,7 @@ def node_item_name_confirm(state):
 
     # 6.处理确认和可选集合! 有确认 -> 继续下个节点  || 有可选or无item_name -> answer赋值结果
     state= step_6_deal_list(state,item_results,history_chats,rewritten_query)
+    state = step_7_build_query_profile(state, rewritten_query)
     # # 7.记录本次的聊天对话(answer回答) !!!!挪到output节点写
 
     # 保存当前次的聊天记录(聊天记录一定会保存的! 提问内容)

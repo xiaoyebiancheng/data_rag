@@ -1,4 +1,5 @@
 import sys
+import uuid
 
 from networkx.algorithms.clique import enumerate_all_cliques
 
@@ -9,6 +10,13 @@ from app.core.logger import logger
 from app.core.load_prompt import load_prompt
 from app.lm.lm_utils import get_llm_client
 from app.clients.mongo_history_utils import save_chat_message
+from app.query_process.answering.trusted_answer import (
+    TrustedAnswer,
+    assess_answer_gate,
+    build_refusal_text,
+    build_sources_from_reranked_docs,
+    verify_answer_support,
+)
 import re
 
 _IMAGE_BLOCK_MARKER = "【图片】"
@@ -39,7 +47,7 @@ def step_1_check_answer(state):
             push_to_session(state["session_id"], SSEEvent.DELTA, {"delta": answer})
         else:
             # 2.非流式
-            set_task_result(state["session_id"], answer)
+            set_task_result(state["session_id"], "answer", answer)
         return True
     else:
         return False
@@ -182,6 +190,45 @@ def step_4_extract_images_url(state):
     return images
 
 
+def step_4_1_build_trusted_answer(state, answer: str):
+    # 增: 增的原因是最终回答需要升级为可追溯、可拒答、可校验的结构化结果，同时保持原有纯文本answer字段兼容。
+    retrieval_config = state.get("retrieval_config", {}) or {}
+    retrieval_trace_id = state.get("retrieval_trace_id") or state.get("session_id") or str(uuid.uuid4())
+    sources = build_sources_from_reranked_docs(state.get("reranked_docs", []), top_n=5)
+    confidence, need_clarification, refusal_reason = assess_answer_gate(
+        state,
+        sources,
+        float(retrieval_config.get("score_threshold", 0.6)),
+    )
+    final_answer = answer or state.get("answer", "")
+    unsupported_claims = []
+    if not refusal_reason and final_answer:
+        unsupported_claims = verify_answer_support(final_answer, sources)
+        if unsupported_claims:
+            confidence = max(0.0, confidence - 0.2)
+            if confidence < 0.4:
+                refusal_reason = "答案存在未被证据支持的结论"
+
+    if refusal_reason:
+        final_answer = build_refusal_text(refusal_reason, need_clarification)
+
+    trusted_answer = TrustedAnswer(
+        answer=final_answer,
+        sources=sources,
+        confidence=round(confidence, 4),
+        need_clarification=need_clarification,
+        refusal_reason=refusal_reason,
+        unsupported_claims=unsupported_claims,
+        retrieval_trace_id=retrieval_trace_id,
+    )
+    state["answer"] = trusted_answer.answer
+    state["answer_metadata"] = trusted_answer.model_dump()
+    state["retrieval_trace_id"] = retrieval_trace_id
+    set_task_result(state["session_id"], "answer", trusted_answer.answer)
+    set_task_result(state["session_id"], "metadata", trusted_answer.model_dump())
+    return trusted_answer
+
+
 def step_5_write_history(state):
     """
     将对话存储到mongodb history
@@ -231,24 +278,54 @@ def node_answer_output(state):
     add_running_task(state["session_id"], sys._getframe().f_code.co_name, state.get("is_stream"))
     # 1.检查state中是否存在answer回答 [item_name(1.明确 [2.不确定 3.没有 ] answer->state)]
     answer_exists = step_1_check_answer(state)
+    trusted_answer = None
     if not answer_exists:
+        precheck_trusted_answer = step_4_1_build_trusted_answer(state, "")
+        if precheck_trusted_answer.refusal_reason:
+            push_to_session(
+                state["session_id"],
+                SSEEvent.FINAL,
+                {
+                    "image_url": [],
+                    "image_urls": [],
+                    "answer": precheck_trusted_answer.answer,
+                    "status": "completed",
+                    "metadata": precheck_trusted_answer.model_dump(),
+                })
+            step_5_write_history(state)
+            add_done_task(state['session_id'], sys._getframe().f_code.co_name, state.get("is_stream"))
+            print("---node_answer_output 节点处理结束---")
+            return state
         # 2.没有 -> 生成对应的润色的提示词 prompt
         prompt = step_2_load_promot(state)
         # 3.没有 -> 使用模型润色答案 ->结果 ->文本
         answer = step_3_create_answer(state, prompt)
         # 4.没有 -> 提取原来的topklist中的图片地址,单独返回[sse]
         image_url = step_4_extract_images_url(state)
-        # 5.sse-final -> 返回图片
-        if image_url:
-            # 不管流式还是非流式,都返回图片
-            push_to_session(
-                state["session_id"],
-                SSEEvent.FINAL,
-                {
-                    "image_url": image_url,
-                    "answer": answer,
-                    "status": "completed"
-                })
+        trusted_answer = step_4_1_build_trusted_answer(state, answer)
+        # 5.sse-final -> 返回图片和结构化metadata
+        push_to_session(
+            state["session_id"],
+            SSEEvent.FINAL,
+            {
+                "image_url": image_url,
+                "image_urls": image_url,
+                "answer": trusted_answer.answer,
+                "status": "completed",
+                "metadata": trusted_answer.model_dump(),
+            })
+    else:
+        trusted_answer = step_4_1_build_trusted_answer(state, state.get("answer", ""))
+        push_to_session(
+            state["session_id"],
+            SSEEvent.FINAL,
+            {
+                "image_url": state.get("image_urls", []),
+                "image_urls": state.get("image_urls", []),
+                "answer": trusted_answer.answer,
+                "status": "completed",
+                "metadata": trusted_answer.model_dump(),
+            })
     # 6.添加对话的聊天记录(mongodb)
     step_5_write_history(state)
     add_done_task(state['session_id'], sys._getframe().f_code.co_name, state.get("is_stream"))

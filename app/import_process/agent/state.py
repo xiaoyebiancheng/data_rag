@@ -49,6 +49,15 @@ class ImportGraphState(TypedDict):
     old_file_hash: str
     previous_doc_ids: list
     minio_urls: list
+    image_summary_audit: list
+    doc_type: str
+    product_line: str
+    language: str
+    source_priority: int
+    tenant_id: str
+    department_id: str
+    visibility: str
+    created_by: str
 
 
 # 建议定一个初始化对象，方便后续使用
@@ -84,6 +93,15 @@ graph_default_state: ImportGraphState = {
     "old_file_hash": "",
     "previous_doc_ids": [],
     "minio_urls": [],
+    "image_summary_audit": [],
+    "doc_type": "other",
+    "product_line": "",
+    "language": "zh-CN",
+    "source_priority": 50,
+    "tenant_id": "default",
+    "department_id": "default",
+    "visibility": "tenant",
+    "created_by": "",
 }
 
 def create_default_state(**overrides) -> ImportGraphState:

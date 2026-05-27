@@ -27,6 +27,16 @@ class QueryGraphState(TypedDict):
     rewritten_query: str  # 改写后的问题
     history: list  # 历史对话记录
     is_stream: bool  # 是否流式输出标记
+    query_type: str  # 查询类型
+    retrieval_config: dict  # 当前查询对应的动态检索配置
+    metadata_filters: dict  # 当前查询对应的 metadata 过滤条件
+    answer_metadata: dict  # 结构化可信答案元数据
+    retrieval_trace_id: str  # 当前检索链路的trace_id
+    user_id: str  # 当前查询用户
+    tenant_id: str  # 当前租户
+    department_id: str  # 当前部门
+    visibility: str  # 当前访问可见性级别
+    security_filter_expr: str  # 当前安全过滤表达式
 
 
 # ========================
@@ -45,7 +55,17 @@ query_graph_default_state: QueryGraphState = {
     "item_names": [],
     "rewritten_query": "",
     "history": [],
-    "is_stream": False
+    "is_stream": False,
+    "query_type": "",
+    "retrieval_config": {},
+    "metadata_filters": {},
+    "answer_metadata": {},
+    "retrieval_trace_id": "",
+    "user_id": "",
+    "tenant_id": "default",
+    "department_id": "default",
+    "visibility": "tenant",
+    "security_filter_expr": "",
 }
 
 

@@ -3,14 +3,10 @@ import re
 import sys
 import base64
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 from collections import deque
 
-# MinIO相关依赖
-from minio import Minio
 from minio.deleteobjects import DeleteObject
-from numpy._core._simd import targets
-from torch.utils.tensorboard import summary
 
 # 【核心改造1：移除原生OpenAI，导入LangChain工具类和多模态消息模块】
 from app.clients.minio_utils import get_minio_client
@@ -33,6 +29,14 @@ from app.core.load_prompt import load_prompt
 
 # MinIO支持的图片格式集合（小写后缀，统一匹配标准）
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
+SUMMARY_STATUS_OK = "ok"
+SUMMARY_STATUS_LOW_CONFIDENCE = "low_confidence"
+SUMMARY_STATUS_FAILED = "failed"
+DEFAULT_FAILED_SUMMARY = "图片摘要生成失败，请以原图为准"
+LOW_CONFIDENCE_PREFIX = "低置信图片摘要"
+FAILED_PREFIX = "图片摘要失败"
+GENERIC_SUMMARIES = {"图片", "图片描述", "示意图", "结构图", "截图", "设备图片", "产品图片"}
+UNCERTAIN_PHRASES = ("看不清", "无法判断", "无法识别", "无法可靠识别", "不确定", "可能是", "似乎是", "大概", "疑似")
 
 """
     主要目标: 将md中的图片进行单独处理,方便后续去模型和识别图片的含义 !
@@ -158,14 +162,66 @@ def encode_image_to_base64(image_path: str) -> str:
     return base64_str
 
 
-def summarize_image(image_path: str, root_folder: str, image_content: Tuple[str, str]) -> str:
+def _failed_image_summary(reason: str) -> Dict[str, Any]:
+    return {
+        "summary": DEFAULT_FAILED_SUMMARY,
+        "status": SUMMARY_STATUS_FAILED,
+        "confidence": 0.0,
+        "reason": reason,
+    }
+
+
+def normalize_image_summary(raw_summary: str) -> Dict[str, Any]:
+    """
+    对 VLM 图片摘要做轻量质量门控。
+    这里不把低质量摘要直接当成事实证据，而是显式标记状态，后续写入 Markdown 和 sources。
+    """
+    summary = (raw_summary or "").strip().replace("\n", " ")
+    summary = re.sub(r"\s+", " ", summary)
+    if not summary:
+        return _failed_image_summary("empty_summary")
+
+    summary = summary[:80]
+    reasons: List[str] = []
+    if summary in GENERIC_SUMMARIES or len(summary) < 6:
+        reasons.append("generic_or_too_short")
+    if any(phrase in summary for phrase in UNCERTAIN_PHRASES):
+        reasons.append("uncertain_expression")
+
+    if reasons:
+        return {
+            "summary": summary,
+            "status": SUMMARY_STATUS_LOW_CONFIDENCE,
+            "confidence": 0.35,
+            "reason": ",".join(reasons),
+        }
+    return {
+        "summary": summary,
+        "status": SUMMARY_STATUS_OK,
+        "confidence": 0.9,
+        "reason": "",
+    }
+
+
+def _coerce_summary_result(summary_result: Any) -> Dict[str, Any]:
+    if isinstance(summary_result, dict):
+        result = dict(summary_result)
+        result.setdefault("summary", DEFAULT_FAILED_SUMMARY)
+        result.setdefault("status", SUMMARY_STATUS_FAILED)
+        result.setdefault("confidence", 0.0)
+        result.setdefault("reason", "")
+        return result
+    return normalize_image_summary(str(summary_result or ""))
+
+
+def summarize_image(image_path: str, root_folder: str, image_content: Tuple[str, str]) -> Dict[str, Any]:
     """
     调用多模态大模型生成图片内容摘要（适配LangChain工具类，复用项目统一LLM客户端）
     生成的摘要用于Markdown图片标题，严格控制50字以内中文描述
     :param image_path: 图片本地完整路径
     :param root_folder: 文档所属文件夹/主名，为大模型提供上下文
     :param image_content: 图片在MD中的上下文元组，格式(上文文本, 下文文本)
-    :return: 图片内容摘要（异常时返回默认值"图片描述"）
+    :return: 图片摘要质量结果，包含 summary/status/confidence/reason
     """
     # 将图片编码为Base64，适配多模态大模型输入要求
     base64_image = encode_image_to_base64(image_path)
@@ -206,15 +262,16 @@ def summarize_image(image_path: str, root_folder: str, image_content: Tuple[str,
 
         # 4. 解析响应（LangChain统一返回content字段，统一格式无需多层解析）
         summary = response.content.strip().replace("\n", "")  # strip()去空格,replace("\n", "")去换行
-        logger.info(f"图片摘要生成成功：{image_path}，摘要：{summary}")
-        return summary
+        result = normalize_image_summary(summary)
+        logger.info(f"图片摘要生成成功：{image_path}，摘要质量：{result}")
+        return result
 
     except LangChainException as e:
         logger.error(f"图片摘要生成失败（LangChain框架异常）：{image_path}，错误信息：{str(e)}")
-        return "图片描述"
+        return _failed_image_summary("langchain_exception")
     except Exception as e:
         logger.error(f"图片摘要生成失败（系统异常）：{image_path}，错误信息：{str(e)}")
-        return "图片描述"
+        return _failed_image_summary("system_exception")
 
 
 def step_3_generate_img_summaries(targets, stem):
@@ -238,6 +295,33 @@ def step_3_generate_img_summaries(targets, stem):
     return summaries
 
 
+def _build_markdown_image_replacement(summary_result: Dict[str, Any], url: str) -> str:
+    summary = str(summary_result.get("summary") or DEFAULT_FAILED_SUMMARY)
+    status = str(summary_result.get("status") or SUMMARY_STATUS_FAILED)
+    confidence = float(summary_result.get("confidence") or 0.0)
+    reason = str(summary_result.get("reason") or "")
+
+    if status == SUMMARY_STATUS_FAILED:
+        alt_text = f"{FAILED_PREFIX}：{summary}"
+    elif status == SUMMARY_STATUS_LOW_CONFIDENCE:
+        alt_text = f"{LOW_CONFIDENCE_PREFIX}：{summary}"
+    else:
+        alt_text = summary
+
+    markdown = f"![{alt_text}]({url})"
+    if status != SUMMARY_STATUS_OK:
+        markdown += (
+            "\n\n<details>\n"
+            "<summary>image_summary_quality</summary>\n\n"
+            f"status: {status}\n"
+            f"confidence: {confidence:.2f}\n"
+            f"reason: {reason or '-'}\n"
+            f"source_url: {url}\n"
+            "</details>"
+        )
+    return markdown
+
+
 def step_4_upload_images_and_update_md(summaries, targets, md_content, stem):
     """
     将我们图片传递到minio服务器 ,看minio官网api
@@ -246,7 +330,7 @@ def step_4_upload_images_and_update_md(summaries, targets, md_content, stem):
     :param targets: (图片名,原地址,(上,下))
     :param md_content: 原md内容
     :param stem: 文件名
-    :return: 新md
+    :return: 新md, 图片摘要审计信息
     """
     # 理解minio存储结果: 桶 / upload-images/文件夹名字/图片.jpg
     minio_client = get_minio_client()
@@ -293,20 +377,31 @@ def step_4_upload_images_and_update_md(summaries, targets, md_content, stem):
     image_infos = {}
     for image_file, summary in summaries.items():
         if url := images_url.get(image_file):
-            image_infos[image_file] = (summary, url)
+            image_infos[image_file] = (_coerce_summary_result(summary), url)
     logger.info(f"图片处理的汇总的汇总结果:{image_infos}")
+    image_summary_audit = []
     if image_infos:
         """
         xxxxx
         xxx ![xx](图片地址/image_file) -> ![summary](minio的url)
         xxxx
         """
-        for image_file, (summary, url) in image_infos.items():
+        for image_file, (summary_result, url) in image_infos.items():
             # 使用正则
-            rep = re.compile(r"!\[.*?\]\(.*?"+image_file+".*?\)")
-            md_content = rep.sub(f"![{summary}]({url})", md_content)
+            rep = re.compile(r"!\[.*?\]\(.*?"+re.escape(image_file)+r".*?\)")
+            md_content = rep.sub(_build_markdown_image_replacement(summary_result, url), md_content)
+            image_summary_audit.append(
+                {
+                    "image_file": image_file,
+                    "source_url": url,
+                    "summary": summary_result.get("summary", ""),
+                    "status": summary_result.get("status", SUMMARY_STATUS_FAILED),
+                    "confidence": summary_result.get("confidence", 0.0),
+                    "reason": summary_result.get("reason", ""),
+                }
+            )
         logger.info(f"图片处理完毕,新的md文件内容为:{md_content}")
-    return md_content
+    return md_content, image_summary_audit
 
 
 def step_5_replace_md_and_save(new_md_content, md_path_obj):
@@ -352,6 +447,15 @@ def node_md_img(state: ImportGraphState) -> ImportGraphState:
     #   参数： 1. md_content 2. images图片的文件夹地址
     #   响应： [(图片名,图片地址,(上文,下文))]
 
+    if os.getenv("IMPORT_SKIP_IMAGE_SUMMARY", "").strip().lower() in {"1", "true", "yes", "y", "on"}:
+        logger.info(f"IMPORT_SKIP_IMAGE_SUMMARY已开启，跳过图片摘要与上传，共跳过{len(targets)}张图片")
+        new_md_file_path = step_5_replace_md_and_save(md_content, md_path_obj)
+        state["md_path"] = new_md_file_path
+        state["md_content"] = md_content
+        logger.info(f">>> [{function_name}] 执行结束了!现在状态为: {state}")
+        add_done_task(state['task_id'], function_name)
+        return state
+
     # 3. 进行图片内容的总结和处理（视觉模型）
     #    参数： 第二次的响应 [(图片名,图片地址,(上文,下文))]  || md文件的名称（提示词中 md文件名就是存储图片images的文件名）
     #    响应： {图片名:总结,......}
@@ -361,7 +465,7 @@ def node_md_img(state: ImportGraphState) -> ImportGraphState:
     #   参数： minio_client || {图片名:总结,......} || [(图片名,图片地址,(上文,下文)) (minio)] || md_content 旧 || md文件的名称（提示词中 md文件名就是存储图片images的文件名）
     #   响应： new_md_content
     #   state[md_content] = new_md_content
-    new_md_content = step_4_upload_images_and_update_md(summaries, targets, md_content, md_path_obj.stem)
+    new_md_content, image_summary_audit = step_4_upload_images_and_update_md(summaries, targets, md_content, md_path_obj.stem)
 
     # 5. 进行数据的最终处理和备份
     #   参数： new_md_content , 原md地址 -> xx.md -> xx_new.md
@@ -370,6 +474,7 @@ def node_md_img(state: ImportGraphState) -> ImportGraphState:
     new_md_file_path = step_5_replace_md_and_save(new_md_content, md_path_obj)
     state['md_path'] = new_md_file_path
     state['md_content']=new_md_content
+    state["image_summary_audit"] = image_summary_audit
     logger.info(f">>> [{function_name}] 执行结束了!现在状态为: {state}")
     add_done_task(state['task_id'], function_name)  # tool中的函数, 用于记录任务状态与前端交互
     return state

@@ -20,6 +20,7 @@ from app.evaluation.metrics import average, hit_at_k, mean_reciprocal_rank, ndcg
 from app.lm.embedding_utils import generate_embeddings
 from app.lm.lm_utils import get_llm_client
 from app.lm.reranker_utils import get_reranker_model
+from app.prompts.prompt_registry import get_prompt_definition
 from app.query_process.agent.nodes.node_rrf import step_3_reciprocal_rank_fusion
 from app.query_process.agent.nodes.node_search_embedding_hyde import step_1_create_hyde_doc
 
@@ -56,6 +57,7 @@ class SampleEvalResult:
     answer_relevance_reason: str = ""
     faithfulness: Optional[float] = None
     faithfulness_reason: str = ""
+    prompt_versions: Dict[str, Dict[str, str]] = field(default_factory=dict)
     error: str = ""
 
 
@@ -101,11 +103,13 @@ class StrategySummary:
 
 
 class RAGEvaluator:
-    def __init__(self, top_k: int = 5):
+    def __init__(self, top_k: int = 5, prompt_versions: Optional[Dict[str, str]] = None):
         # 增: 增的原因是离线评测需要一个独立入口对象，统一组织“检索 -> 生成 -> Judge -> 聚合”全流程，避免污染线上查询链路。
         self.top_k = top_k
         self.milvus_client = get_milvus_client()
         self.output_fields = ["chunk_id", "content", "file_title", "title", "parent_title", "item_name"]
+        # 增: 增的原因是评测需要在不改线上默认版本的前提下，显式指定参与评测的 Prompt 版本，方便做 Prompt 回归对比。
+        self.prompt_versions = dict(prompt_versions or {})
 
     def evaluate(self, samples: Sequence[EvalSample], strategies: Sequence[str]) -> List[StrategySummary]:
         summaries: List[StrategySummary] = []
@@ -119,6 +123,7 @@ class RAGEvaluator:
 
     def _evaluate_single_sample(self, sample: EvalSample, strategy: str) -> SampleEvalResult:
         result = SampleEvalResult(sample=sample, strategy=strategy)
+        result.prompt_versions = self._build_prompt_version_snapshot()
         start_time = time.perf_counter()
         try:
             docs = self._run_strategy(sample, strategy)
@@ -272,8 +277,10 @@ class RAGEvaluator:
             return f"[answer_generation_failed] {exc}"
 
     def _judge_answer_relevance(self, sample: EvalSample, answer: str) -> JudgeScore:
+        prompt_name = "eval_answer_relevance_judge"
         prompt = load_prompt(
-            "eval_answer_relevance_judge",
+            prompt_name,
+            version=self.prompt_versions.get(prompt_name),
             question=sample.question,
             answer=answer,
             golden_answer=sample.golden_answer or "无参考答案",
@@ -285,8 +292,10 @@ class RAGEvaluator:
             f"[{index}] {doc.get('title', '')}\n{doc.get('text', '')}"
             for index, doc in enumerate(docs, start=1)
         ) or "无检索上下文"
+        prompt_name = "eval_faithfulness_judge"
         prompt = load_prompt(
-            "eval_faithfulness_judge",
+            prompt_name,
+            version=self.prompt_versions.get(prompt_name),
             question=sample.question,
             answer=answer,
             context=context,
@@ -323,14 +332,25 @@ class RAGEvaluator:
                 break
             context_blocks.append(block)
             total_chars += len(block)
-
+        prompt_name = "answer_out"
         return load_prompt(
-            "answer_out",
+            prompt_name,
+            version=self.prompt_versions.get(prompt_name),
             context="\n\n".join(context_blocks) or "无可用上下文",
             history="没有历史对话记录",
             item_names=",".join(sample.item_names),
             question=sample.question,
         )
+
+    def _build_prompt_version_snapshot(self) -> Dict[str, Dict[str, str]]:
+        snapshot: Dict[str, Dict[str, str]] = {}
+        for prompt_name in ["answer_out", "eval_answer_relevance_judge", "eval_faithfulness_judge"]:
+            definition = get_prompt_definition(prompt_name, version=self.prompt_versions.get(prompt_name))
+            snapshot[prompt_name] = {
+                "prompt_name": definition.prompt_name,
+                "prompt_version": definition.version,
+            }
+        return snapshot
 
     def _build_item_filter(self, item_names: Sequence[str]) -> str:
         cleaned = [name.replace('"', '\\"') for name in item_names if name]

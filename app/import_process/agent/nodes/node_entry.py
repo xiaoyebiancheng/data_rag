@@ -9,7 +9,7 @@ from app.core.logger import logger
 from app.import_process.agent.state import ImportGraphState
 from app.utils.hash_utils import calculate_file_sha256
 from app.utils.escape_milvus_string_utils import escape_milvus_string
-from app.utils.task_utils import add_running_task, add_done_task
+from app.utils.task_utils import add_running_task, add_done_task, set_task_result, update_import_task_fields
 
 
 def _has_legacy_same_title(file_title_value: str) -> bool:
@@ -77,10 +77,13 @@ def node_entry(state: ImportGraphState) -> ImportGraphState:
     file_title = os.path.basename(local_file_path).split(".")[0]
     # file_title = Path(local_file_path).stem # 去掉后缀的文件名  .suffix 取后缀
     state["file_title"] = str(file_title)
+    set_task_result(state["task_id"], "file_title", state["file_title"])
 
     # 增: 增的原因是版本管理和重复上传识别都依赖稳定的文件内容哈希，必须在导入最前面完成计算。
     file_hash = calculate_file_sha256(local_file_path)
     state["file_hash"] = file_hash
+    set_task_result(state["task_id"], "file_hash", file_hash)
+    update_import_task_fields(state["task_id"], file_hash=file_hash, file_title=state["file_title"])
 
     # 增: 增的原因是导入流程需要在入口就完成重复上传/同名新版本判定，避免重复执行解析、切片和向量化。
     repository = get_document_meta_repository()

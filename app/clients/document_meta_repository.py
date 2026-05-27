@@ -42,11 +42,15 @@ class DocumentMetaRepository:
         self.document_meta.create_index([("file_hash", ASCENDING), ("status", ASCENDING)])
         self.document_meta.create_index([("file_title", ASCENDING), ("version", DESCENDING)])
         self.document_meta.create_index([("status", ASCENDING), ("updated_at", DESCENDING)])
+        self.document_meta.create_index([("tenant_id", ASCENDING), ("visibility", ASCENDING), ("updated_at", DESCENDING)])
+        self.document_meta.create_index([("doc_type", ASCENDING), ("product_line", ASCENDING)])
 
         # 增: 增的原因是chunk元数据需要支撑按doc_id、chunk_id、状态批量清理和列表查询。
         self.chunk_meta.create_index([("chunk_id", ASCENDING)], unique=True)
         self.chunk_meta.create_index([("doc_id", ASCENDING), ("status", ASCENDING)])
         self.chunk_meta.create_index([("file_hash", ASCENDING), ("status", ASCENDING)])
+        self.chunk_meta.create_index([("tenant_id", ASCENDING), ("visibility", ASCENDING), ("status", ASCENDING)])
+        self.chunk_meta.create_index([("doc_type", ASCENDING), ("section_type", ASCENDING), ("status", ASCENDING)])
 
     @staticmethod
     def _utcnow() -> datetime:
@@ -58,11 +62,14 @@ class DocumentMetaRepository:
             "status": DocumentStatus.ACTIVE,
         })
 
-    def find_active_by_doc_id(self, doc_id: str) -> Optional[Dict[str, Any]]:
-        return self.document_meta.find_one({
+    def find_active_by_doc_id(self, doc_id: str, extra_filters: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        query = {
             "doc_id": doc_id,
             "status": {"$in": [DocumentStatus.ACTIVE, DocumentStatus.REPLACED, DocumentStatus.DELETED, DocumentStatus.FAILED]},
-        })
+        }
+        if extra_filters:
+            query.update(extra_filters)
+        return self.document_meta.find_one(query)
 
     def find_latest_by_file_title(self, file_title: str) -> Optional[Dict[str, Any]]:
         return self.document_meta.find_one(
@@ -70,22 +77,33 @@ class DocumentMetaRepository:
             sort=[("version", DESCENDING), ("updated_at", DESCENDING)],
         )
 
-    def list_documents(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list_documents(self, status: Optional[str] = None, extra_filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         query: Dict[str, Any] = {}
         if status:
             query["status"] = status
+        if extra_filters:
+            query.update(extra_filters)
         cursor = self.document_meta.find(query).sort([("updated_at", DESCENDING), ("version", DESCENDING)])
         return [self._serialize_document_meta(doc) for doc in cursor]
 
-    def list_versions(self, doc_id: str) -> List[Dict[str, Any]]:
-        current = self.document_meta.find_one({"doc_id": doc_id})
+    def list_versions(self, doc_id: str, extra_filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        query = {"doc_id": doc_id}
+        if extra_filters:
+            query.update(extra_filters)
+        current = self.document_meta.find_one(query)
         if not current:
             return []
-        cursor = self.document_meta.find({"file_title": current["file_title"]}).sort([("version", DESCENDING)])
+        list_query = {"file_title": current["file_title"]}
+        if extra_filters:
+            list_query.update(extra_filters)
+        cursor = self.document_meta.find(list_query).sort([("version", DESCENDING)])
         return [self._serialize_document_meta(doc) for doc in cursor]
 
-    def list_chunks(self, doc_id: str) -> List[Dict[str, Any]]:
-        cursor = self.chunk_meta.find({"doc_id": doc_id}).sort([("created_at", ASCENDING)])
+    def list_chunks(self, doc_id: str, extra_filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        query = {"doc_id": doc_id}
+        if extra_filters:
+            query.update(extra_filters)
+        cursor = self.chunk_meta.find(query).sort([("created_at", ASCENDING)])
         return [self._serialize_chunk_meta(doc) for doc in cursor]
 
     def upsert_document_meta(self, document: Dict[str, Any]) -> None:
